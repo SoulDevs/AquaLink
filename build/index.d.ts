@@ -124,13 +124,23 @@ declare module 'aqualink' {
      * Searches for tracks
      * @param query Search query
      * @param requester Requester object
-     * @param source Search source (ytsearch, scsearch, etc)
+      * @param source Search source (spsearch, dzsearch, jssearch, etc)
      */
     search(
       query: string,
       requester: any,
       source?: SearchSource
     ): Promise<Track[] | null>
+
+    /**
+     * Executes a LavaSearch query (tracks, artists, albums, playlists, texts)
+     * when supported by the node/plugins, with fallback to regular resolve.
+     */
+    lavaSearch(
+      query: LavaSearchQuery | string,
+      requester: any,
+      throwOnEmpty?: boolean
+    ): Promise<LavaSearchResponse | null>
 
     // Save/Load Methods
     savePlayer(filePath?: string): Promise<void>
@@ -455,6 +465,21 @@ declare module 'aqualink' {
     liveLyrics(guildId: string, state: boolean): Promise<any>
     autoplay(): Promise<Player>
     setAutoplay(enabled: boolean): Player
+    search(
+      query: string,
+      requester: any,
+      source?: SearchSource | string
+    ): Promise<ResolveResponse | null>
+    lavaSearch(
+      query: LavaSearchQuery | string,
+      requester: any,
+      throwOnEmpty?: boolean
+    ): Promise<LavaSearchResponse | null>
+    addSimilarTracks(
+      amount?: number,
+      requester?: any,
+      options?: SimilarTrackOptions
+    ): Promise<SimilarTrackResult>
     updatePlayer(data: any): Promise<any>
     cleanup(): Promise<void>
     getActiveMixer(guildId: string): Promise<any[]>
@@ -898,6 +923,40 @@ declare module 'aqualink' {
     nodes?: string | Node | Node[]
   }
 
+  export type LavaSearchType =
+    | 'track'
+    | 'playlist'
+    | 'artist'
+    | 'album'
+    | 'text'
+
+  export interface LavaSearchQuery {
+    query: string
+    source?: SearchSource | string
+    types?: LavaSearchType[]
+    nodes?: string | Node | Node[]
+  }
+
+  export interface LavaSearchEntityResult {
+    info: Record<string, any>
+    pluginInfo: Record<string, any>
+    tracks: Track[]
+  }
+
+  export interface LavaSearchTextResult {
+    text: string
+    pluginInfo: Record<string, any>
+  }
+
+  export interface LavaSearchResponse {
+    tracks: Track[]
+    albums: LavaSearchEntityResult[]
+    artists: LavaSearchEntityResult[]
+    playlists: LavaSearchEntityResult[]
+    texts: LavaSearchTextResult[]
+    pluginInfo: Record<string, any>
+  }
+
   // Response and Data Interfaces
   export interface ResolveResponse {
     loadType: LoadType
@@ -1116,6 +1175,18 @@ declare module 'aqualink' {
     artistIds: string
   }
 
+  export interface SimilarTrackOptions {
+    source?: SearchSource | string
+    maxAmount?: number
+  }
+
+  export interface SimilarTrackResult {
+    added: Track[]
+    skipped: number
+    query: string | null
+    source: string | null
+  }
+
   export interface UpdatePlayerOptions {
     guildId: string
     data: {
@@ -1307,8 +1378,20 @@ declare module 'aqualink' {
     | 'ytmsearch'
     | 'scsearch'
     | 'spsearch'
+    | 'sprec'
+    | 'jssearch'
+    | 'jsrec'
     | 'amsearch'
+    | 'aumsearch'
     | 'dzsearch'
+    | 'dzisrc'
+    | 'dzrec'
+    | 'tdsearch'
+    | 'tdrec'
+    | 'qbsearch'
+    | 'qbisrc'
+    | 'qbrec'
+    | 'gaanasearch'
     | 'yandexsearch'
     | 'soundcloud'
     | 'youtube'

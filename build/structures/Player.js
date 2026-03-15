@@ -65,7 +65,7 @@ const _functions = {
   toId: (v) => v?.id || v || null,
   isNum: (v) => typeof v === 'number' && !Number.isNaN(v),
   isInvalidLoad: (r) => !r?.tracks?.length || INVALID_LOADS.has(r.loadType),
-  safeDel: (msg) => msg?.delete?.().catch(() => {}),
+  safeDel: (msg) => msg?.delete?.().catch(() => { }),
   createTimer(fn, delay, timerSet, unref = true) {
     const t = setTimeout(() => {
       timerSet?.delete(t)
@@ -83,7 +83,7 @@ const _functions = {
   safeCall(fn) {
     try {
       return fn?.()
-    } catch {}
+    } catch { }
     return null
   },
   emitAquaError(aqua, error) {
@@ -92,7 +92,7 @@ const _functions = {
       if (aqua.listenerCount(AqualinkEvents.Error) > 0) {
         aqua.emit(AqualinkEvents.Error, error)
       }
-    } catch {}
+    } catch { }
   },
   emitIfActive(player, event, ...args) {
     if (!player.destroyed) player.aqua.emit(event, player, ...args)
@@ -348,6 +348,326 @@ class Player extends EventEmitter {
     this.isAutoplayEnabled = !!enabled
     this.autoplayRetries = 0
     return this
+  }
+
+  async search(query, requester, source) {
+    if (this.destroyed || !this.aqua?.resolve || !query || !requester) return null
+    try {
+      return await this.aqua.resolve({
+        query,
+        source: source || this.aqua.defaultSearchPlatform,
+        requester,
+        nodes: this.nodes
+      })
+    } catch {
+      return null
+    }
+  }
+
+  async lavaSearch(query, requester, throwOnEmpty = false) {
+    if (this.destroyed || !this.aqua?.lavaSearch || !query || !requester)
+      return null
+    const payload =
+      typeof query === 'string'
+        ? { query, nodes: this.nodes }
+        : { ...query, nodes: query.nodes || this.nodes }
+    try {
+      return await this.aqua.lavaSearch(payload, requester, throwOnEmpty)
+    } catch {
+      return null
+    }
+  }
+
+  async addSimilarTracks(amount = 5, requester = null, options = {}) {
+    if (this.destroyed || !this.current || !this.queue || !this.aqua?.resolve) {
+      return { added: [], skipped: 0, query: null, source: null }
+    }
+
+    const currentInfo = this.current.info || {}
+    const rawCurrentAuthor = currentInfo.author ?? this.current.author ?? ''
+    const currentTitle = String(currentInfo.title || this.current.title || '')
+    const currentAuthor = String(rawCurrentAuthor || '')
+    const currentIdentifier = String(
+      currentInfo.identifier || this.current.identifier || ''
+    )
+    const currentUri = String(currentInfo.uri || this.current.uri || '')
+    if (!currentTitle && !currentIdentifier) {
+      return { added: [], skipped: 0, query: null, source: null }
+    }
+
+    const requestUser = requester || this.current.requester || { id: 'Unknown' }
+    const maxAmount = Math.max(1, Number(options.maxAmount) || 10)
+    const resolvedAmount = Math.max(1, Math.min(Number(amount) || 5, maxAmount))
+    const sourceName = String(currentInfo.sourceName || '').toLowerCase().trim()
+    const isNodelink = !!this.nodes?.isNodelink || !!this.nodes?.info?.isNodelink
+    const pluginInfo =
+      currentInfo?.pluginInfo && typeof currentInfo.pluginInfo === 'object'
+        ? currentInfo.pluginInfo
+        : this.current?.pluginInfo && typeof this.current.pluginInfo === 'object'
+          ? this.current.pluginInfo
+          : {}
+
+    const asString = (value) => {
+      if (value === undefined || value === null) return ''
+      if (typeof value === 'string' || typeof value === 'number')
+        return String(value).trim()
+      return ''
+    }
+    const firstValue = (...values) => {
+      for (const value of values) {
+        const parsed = asString(value)
+        if (parsed) return parsed
+      }
+      return ''
+    }
+    const firstPluginValue = (keys = []) => {
+      for (const key of keys) {
+        const raw = pluginInfo?.[key]
+        const parsed = firstValue(raw, raw?.id, raw?.identifier, raw?.trackId)
+        if (parsed) return parsed
+      }
+      return ''
+    }
+    const toNumericId = (value) => {
+      const parsed = asString(value)
+      return /^\d+$/.test(parsed) ? parsed : ''
+    }
+    const toIsrc = (value) => {
+      const parsed = asString(value).toUpperCase()
+      return /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(parsed) ? parsed : ''
+    }
+
+    const seedIdentifier = firstValue(currentIdentifier)
+    const seedIsrc = toIsrc(
+      firstValue(
+        currentInfo?.isrc,
+        currentInfo?.ISRC,
+        firstPluginValue([
+          'isrc',
+          'ISRC',
+          'internationalStandardRecordingCode'
+        ]),
+        currentIdentifier
+      )
+    )
+    const seedTrackId = toNumericId(
+      firstValue(
+        firstPluginValue([
+          'trackId',
+          'track_id',
+          'id',
+          'songId',
+          'song_id',
+          'deezerId',
+          'deezer_id',
+          'tidalId',
+          'tidal_id',
+          'qobuzId',
+          'qobuz_id'
+        ]),
+        currentIdentifier
+      )
+    )
+    const seedArtistId = toNumericId(
+      firstValue(
+        firstPluginValue([
+          'artistId',
+          'artist_id',
+          'mainArtistId',
+          'main_artist_id'
+        ])
+      )
+    )
+    const seedAlbumId = toNumericId(
+      firstValue(firstPluginValue(['albumId', 'album_id']))
+    )
+
+    const attempts = []
+    const seenAttempts = new Set()
+    const pushAttempt = (queryText, sourceText) => {
+      if (!queryText || !sourceText) return
+      const key = `${sourceText}:${queryText}`
+      if (seenAttempts.has(key)) return
+      seenAttempts.add(key)
+      attempts.push({ query: queryText, source: sourceText })
+    }
+
+    if (sourceName === 'spotify' && seedIdentifier && !isNodelink) {
+      pushAttempt(seedIdentifier, 'sprec')
+      pushAttempt(`mix:track:${seedIdentifier}`, 'sprec')
+      if (seedArtistId) pushAttempt(`mix:artist:${seedArtistId}`, 'sprec')
+      if (seedAlbumId) pushAttempt(`mix:album:${seedAlbumId}`, 'sprec')
+      if (seedIsrc) pushAttempt(`mix:isrc:${seedIsrc}`, 'sprec')
+    }
+
+    if (sourceName.includes('deezer')) {
+      if (seedTrackId) {
+        pushAttempt(seedTrackId, 'dzrec')
+        pushAttempt(`track=${seedTrackId}`, 'dzrec')
+      }
+      if (seedArtistId) pushAttempt(`artist=${seedArtistId}`, 'dzrec')
+      if (seedIsrc) pushAttempt(seedIsrc, 'dzisrc')
+    }
+
+    if (sourceName.includes('jiosaavn') && seedIdentifier) {
+      pushAttempt(seedIdentifier, 'jsrec')
+    }
+
+    if (sourceName.includes('tidal') && (seedTrackId || seedIdentifier)) {
+      pushAttempt(seedTrackId || seedIdentifier, 'tdrec')
+    }
+
+    if (sourceName.includes('qobuz')) {
+      if (seedTrackId) pushAttempt(seedTrackId, 'qbrec')
+      if (seedIsrc) pushAttempt(seedIsrc, 'qbisrc')
+    }
+
+    if (seedIsrc) {
+      pushAttempt(seedIsrc, 'dzisrc')
+      pushAttempt(seedIsrc, 'qbisrc')
+      pushAttempt(`isrc:${seedIsrc}`, 'spsearch')
+    }
+
+    if (seedTrackId) {
+      pushAttempt(seedTrackId, 'dzrec')
+      pushAttempt(`track=${seedTrackId}`, 'dzrec')
+      pushAttempt(seedTrackId, 'tdrec')
+      pushAttempt(seedTrackId, 'qbrec')
+    }
+
+    if (seedArtistId) {
+      pushAttempt(`artist=${seedArtistId}`, 'dzrec')
+    }
+
+    const fallbackQuery = `similar to:${currentTitle} ${currentAuthor}`.trim()
+    const sourceCandidates = [
+      options.source,
+      this.aqua.defaultSearchPlatform,
+      'spsearch',
+      'dzsearch',
+      'jssearch',
+      'amsearch',
+      'tdsearch',
+      'qbsearch',
+      'gaanasearch',
+      'aumsearch',
+      'scsearch'
+    ]
+    for (const source of sourceCandidates) {
+      if (!source) continue
+      pushAttempt(fallbackQuery, source)
+    }
+
+    let response = null
+    let usedQuery = null
+    let usedSource = null
+
+    for (const attempt of attempts) {
+      try {
+        const res = await this.aqua.resolve({
+          query: attempt.query,
+          source: attempt.source,
+          requester: requestUser,
+          nodes: this.nodes
+        })
+        if (res?.tracks?.length) {
+          response = res
+          usedQuery = attempt.query
+          usedSource = attempt.source
+          break
+        }
+      } catch { }
+    }
+
+    if (
+      (!response?.tracks?.length || !response) &&
+      sourceName === 'spotify' &&
+      isNodelink
+    ) {
+      if (!this.autoplaySeed && currentIdentifier) {
+        this.autoplaySeed = {
+          trackId: currentIdentifier,
+          artistIds: Array.isArray(rawCurrentAuthor)
+            ? rawCurrentAuthor.join(',')
+            : String(rawCurrentAuthor || '')
+        }
+      }
+      const spResults = await spAutoPlay(
+        this.autoplaySeed,
+        this,
+        requestUser,
+        Array.from(this.previousIdentifiers || [])
+      )
+      if (spResults?.length) {
+        response = { tracks: spResults }
+        usedQuery = currentIdentifier || fallbackQuery
+        usedSource = 'spsearch'
+      }
+    }
+
+    const resultTracks = response?.tracks || []
+    if (!resultTracks.length) {
+      return { added: [], skipped: 0, query: usedQuery, source: usedSource }
+    }
+
+    const normalizedCurrentTitle = currentTitle.toLowerCase()
+    const normalizedCurrentAuthor = currentAuthor.toLowerCase()
+    const seenTracks = new Set()
+    if (currentIdentifier) seenTracks.add(`id:${currentIdentifier}`)
+    if (currentUri) seenTracks.add(`uri:${currentUri}`)
+
+    for (const queuedTrack of this.queue.toArray()) {
+      const queuedInfo = queuedTrack?.info || {}
+      if (queuedInfo.identifier) seenTracks.add(`id:${queuedInfo.identifier}`)
+      if (queuedInfo.uri) seenTracks.add(`uri:${queuedInfo.uri}`)
+    }
+
+    let skipped = 0
+    const added = []
+    for (const track of resultTracks) {
+      const info = track?.info || {}
+      const identifier = info.identifier || track.identifier || ''
+      const uri = info.uri || track.uri || ''
+      const title = String(info.title || track.title || '').toLowerCase()
+      const author = String(info.author || track.author || '').toLowerCase()
+
+      if (!title) {
+        skipped++
+        continue
+      }
+      if (identifier && seenTracks.has(`id:${identifier}`)) {
+        skipped++
+        continue
+      }
+      if (uri && seenTracks.has(`uri:${uri}`)) {
+        skipped++
+        continue
+      }
+      if (title === normalizedCurrentTitle && author === normalizedCurrentAuthor) {
+        skipped++
+        continue
+      }
+      if (title === normalizedCurrentTitle) {
+        skipped++
+        continue
+      }
+      if (
+        (normalizedCurrentTitle.includes(title) ||
+          title.includes(normalizedCurrentTitle)) &&
+        Math.abs(normalizedCurrentTitle.length - title.length) < 10
+      ) {
+        skipped++
+        continue
+      }
+
+      if (identifier) seenTracks.add(`id:${identifier}`)
+      if (uri) seenTracks.add(`uri:${uri}`)
+      added.push(track)
+      if (added.length >= resolvedAmount) break
+    }
+
+    if (added.length) this.queue.add(...added)
+    return { added, skipped, query: usedQuery, source: usedSource }
   }
 
   async play(track, options = {}) {
@@ -658,7 +978,7 @@ class Player extends EventEmitter {
       this.current =
       this.autoplaySeed =
       this._lifecycleController =
-        null
+      null
 
     if (!skipRemote) {
       try {
@@ -972,17 +1292,118 @@ class Player extends EventEmitter {
   }
 
   async _getAutoplayTrack(sourceName, identifier, uri, requester) {
-    if (sourceName === 'youtube' || sourceName === 'ytmusic') {
-      const res = await this.aqua.resolve({
-        query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`,
-        source: 'ytmsearch',
-        requester
-      })
-      return _functions.isInvalidLoad(res)
-        ? null
-        : res.tracks[_functions.randIdx(res.tracks.length)]
+    const normalizedSource = String(sourceName || '').toLowerCase().trim()
+
+    const currentInfo = this.current?.info || {}
+    const pluginInfo =
+      currentInfo?.pluginInfo && typeof currentInfo.pluginInfo === 'object'
+        ? currentInfo.pluginInfo
+        : this.current?.pluginInfo && typeof this.current.pluginInfo === 'object'
+          ? this.current.pluginInfo
+          : {}
+
+    const asString = (value) => {
+      if (value === undefined || value === null) return ''
+      if (typeof value === 'string' || typeof value === 'number')
+        return String(value).trim()
+      return ''
     }
-    if (sourceName === 'soundcloud') {
+    const firstValue = (...values) => {
+      for (const value of values) {
+        const parsed = asString(value)
+        if (parsed) return parsed
+      }
+      return ''
+    }
+    const firstPluginValue = (keys = []) => {
+      for (const key of keys) {
+        const raw = pluginInfo?.[key]
+        const parsed = firstValue(raw, raw?.id, raw?.identifier, raw?.trackId)
+        if (parsed) return parsed
+      }
+      return ''
+    }
+    const toNumericId = (value) => {
+      const parsed = asString(value)
+      return /^\d+$/.test(parsed) ? parsed : ''
+    }
+    const toIsrc = (value) => {
+      const parsed = asString(value).toUpperCase()
+      return /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(parsed) ? parsed : ''
+    }
+
+    const seedIdentifier = firstValue(identifier, currentInfo.identifier)
+    const seedIsrc = toIsrc(
+      firstValue(
+        currentInfo?.isrc,
+        currentInfo?.ISRC,
+        firstPluginValue([
+          'isrc',
+          'ISRC',
+          'internationalStandardRecordingCode'
+        ]),
+        seedIdentifier
+      )
+    )
+    const seedTrackId = toNumericId(
+      firstValue(
+        firstPluginValue([
+          'trackId',
+          'track_id',
+          'id',
+          'songId',
+          'song_id',
+          'deezerId',
+          'deezer_id',
+          'tidalId',
+          'tidal_id',
+          'qobuzId',
+          'qobuz_id'
+        ]),
+        seedIdentifier
+      )
+    )
+    const seedArtistId = toNumericId(
+      firstValue(
+        firstPluginValue([
+          'artistId',
+          'artist_id',
+          'mainArtistId',
+          'main_artist_id'
+        ])
+      )
+    )
+    const seedAlbumId = toNumericId(
+      firstValue(firstPluginValue(['albumId', 'album_id']))
+    )
+
+    const seen = new Set(Array.from(this.previousIdentifiers || []))
+    const currentId = this.current?.info?.identifier || this.current?.identifier
+    if (currentId) seen.add(currentId)
+
+    const pickCandidate = (tracks = []) => {
+      const candidates = tracks.filter((track) => {
+        const id = track?.info?.identifier || track?.identifier
+        return id ? !seen.has(id) : true
+      })
+      return candidates.length
+        ? candidates[_functions.randIdx(candidates.length)]
+        : null
+    }
+
+    const resolveAttempt = async (queryText, sourceText) => {
+      if (!queryText || !sourceText) return null
+      const res = await this.aqua.resolve({
+        query: queryText,
+        source: sourceText,
+        requester,
+        nodes: this.nodes
+      })
+      if (_functions.isInvalidLoad(res)) return null
+      return pickCandidate(res.tracks || [])
+    }
+
+    if (normalizedSource === 'soundcloud') {
       const scRes = await scAutoPlay(uri)
       if (!scRes?.length) return null
       const res = await this.aqua.resolve({
@@ -994,15 +1415,120 @@ class Player extends EventEmitter {
         ? null
         : res.tracks[_functions.randIdx(res.tracks.length)]
     }
-    if (sourceName === 'spotify') {
+    if (normalizedSource === 'spotify') {
+      const isNodelink = !!this.nodes?.isNodelink || !!this.nodes?.info?.isNodelink
+      if (!isNodelink && seedIdentifier) {
+        const spotifyAttempts = [
+          { source: 'sprec', query: seedIdentifier },
+          { source: 'sprec', query: `mix:track:${seedIdentifier}` }
+        ]
+        if (seedArtistId)
+          spotifyAttempts.push({
+            source: 'sprec',
+            query: `mix:artist:${seedArtistId}`
+          })
+        if (seedAlbumId)
+          spotifyAttempts.push({
+            source: 'sprec',
+            query: `mix:album:${seedAlbumId}`
+          })
+        if (seedIsrc)
+          spotifyAttempts.push({
+            source: 'sprec',
+            query: `mix:isrc:${seedIsrc}`
+          })
+
+        for (const attempt of spotifyAttempts) {
+          try {
+            const track = await resolveAttempt(attempt.query, attempt.source)
+            if (track) return track
+          } catch { }
+        }
+      }
+
       const res = await spAutoPlay(
         this.autoplaySeed,
         this,
         requester,
         Array.from(this.previousIdentifiers)
       )
-      return res?.length ? res[_functions.randIdx(res.length)] : null
+      return res?.length ? pickCandidate(res) : null
     }
+
+    const attempts = []
+    const seenAttempts = new Set()
+    const pushAttempt = (queryText, sourceText) => {
+      if (!queryText || !sourceText) return
+      const key = `${sourceText}:${queryText}`
+      if (seenAttempts.has(key)) return
+      seenAttempts.add(key)
+      attempts.push({ query: queryText, source: sourceText })
+    }
+
+    if (normalizedSource.includes('deezer')) {
+      if (seedTrackId) {
+        pushAttempt(seedTrackId, 'dzrec')
+        pushAttempt(`track=${seedTrackId}`, 'dzrec')
+      }
+      if (seedArtistId) pushAttempt(`artist=${seedArtistId}`, 'dzrec')
+      if (seedIsrc) pushAttempt(seedIsrc, 'dzisrc')
+    }
+
+    if (normalizedSource.includes('jiosaavn') && seedIdentifier) {
+      pushAttempt(seedIdentifier, 'jsrec')
+    }
+
+    if (normalizedSource.includes('tidal') && (seedTrackId || seedIdentifier)) {
+      pushAttempt(seedTrackId || seedIdentifier, 'tdrec')
+    }
+
+    if (normalizedSource.includes('qobuz')) {
+      if (seedTrackId) pushAttempt(seedTrackId, 'qbrec')
+      if (seedIsrc) pushAttempt(seedIsrc, 'qbisrc')
+    }
+
+    if (seedIsrc) {
+      pushAttempt(seedIsrc, 'dzisrc')
+      pushAttempt(seedIsrc, 'qbisrc')
+      pushAttempt(`isrc:${seedIsrc}`, 'spsearch')
+    }
+
+    if (seedTrackId) {
+      pushAttempt(seedTrackId, 'dzrec')
+      pushAttempt(`track=${seedTrackId}`, 'dzrec')
+      pushAttempt(seedTrackId, 'tdrec')
+      pushAttempt(seedTrackId, 'qbrec')
+    }
+
+    if (seedArtistId) {
+      pushAttempt(`artist=${seedArtistId}`, 'dzrec')
+    }
+
+    const fallbackQuery = `similar to:${firstValue(currentInfo.title, this.current?.title)} ${firstValue(currentInfo.author, this.current?.author)}`.trim()
+    const fallbackSources = [
+      this.aqua.defaultSearchPlatform,
+      'spsearch',
+      'dzsearch',
+      'jssearch',
+      'amsearch',
+      'tdsearch',
+      'qbsearch',
+      'gaanasearch',
+      'aumsearch',
+      'scsearch'
+    ]
+    for (const source of fallbackSources) {
+      if (!source) continue
+      pushAttempt(fallbackQuery, source)
+    }
+
+    for (const attempt of attempts) {
+      try {
+        const track = await resolveAttempt(attempt.query, attempt.source)
+        if (track) return track
+      } catch { }
+    }
+
     return null
   }
 

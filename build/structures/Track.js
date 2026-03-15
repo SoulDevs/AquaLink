@@ -64,7 +64,7 @@ class Track {
     if (!aqua?.resolve) return null
 
     const platform =
-      opts.platform || aqua?.options?.defaultSearchPlatform || 'ytsearch'
+      opts.platform || aqua?.options?.defaultSearchPlatform || 'spsearch'
     const node = opts.nodes || opts.node || this.node || this.nodes
 
     let query = this.uri
@@ -121,7 +121,7 @@ class Track {
   isValid() {
     return Boolean(
       (typeof this.track === 'string' && this.track) ||
-        (typeof this.uri === 'string' && this.uri)
+      (typeof this.uri === 'string' && this.uri)
     )
   }
 
@@ -132,14 +132,14 @@ class Track {
       this.nodes =
       this.playlist =
       this.track =
-        null
+      null
     this.identifier =
       this.author =
       this.title =
       this.uri =
       this.sourceName =
       this.artworkUrl =
-        ''
+      ''
   }
 
   _computeArtwork() {

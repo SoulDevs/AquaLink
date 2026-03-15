@@ -33,10 +33,40 @@ const MAX_REBUILD_LOCKS = 100
 const WRITE_BUFFER_SIZE = 100
 const TRACE_BUFFER_SIZE = 3000
 const VOICE_STATE_QUEUE_INTERVAL = 900
+const LAVASEARCH_TYPES = Object.freeze([
+  'track',
+  'playlist',
+  'artist',
+  'album',
+  'text'
+])
+const LAVASEARCH_DEFAULT_TYPES = Object.freeze([
+  'track',
+  'playlist',
+  'artist',
+  'album'
+])
+const LAVASEARCH_SOURCES = new Set([
+  'spsearch',
+  'sprec',
+  'amsearch',
+  'dzsearch',
+  'dzisrc',
+  'dzrec',
+  'jssearch',
+  'jsrec',
+  'tdsearch',
+  'tdrec',
+  'qbsearch',
+  'qbrec',
+  'qbisrc',
+  'gaanasearch',
+  'aumsearch'
+])
 
 const DEFAULT_OPTIONS = Object.freeze({
   shouldDeleteMessage: false,
-  defaultSearchPlatform: 'ytsearch',
+  defaultSearchPlatform: 'spsearch',
   leaveOnEnd: false,
   restVersion: 'v4',
   plugins: [],
@@ -69,7 +99,7 @@ const _functions = {
       const t = setTimeout(r, ms)
       t.unref?.()
     }),
-  noop: () => {},
+  noop: () => { },
   isUrl: (query) => {
     if (typeof query !== 'string' || query.length <= 8) return false
     const q = query.trimStart()
@@ -83,7 +113,7 @@ const _functions = {
     try {
       const result = fn()
       return result?.then ? result.catch(this.noop) : result
-    } catch {}
+    } catch { }
   },
   parseRequester(str) {
     if (!str || typeof str !== 'string') return null
@@ -142,7 +172,7 @@ class Aqua extends EventEmitter {
     )
     this.brokenPlayerStorePath =
       typeof merged.brokenPlayerStorePath === 'string' &&
-      merged.brokenPlayerStorePath.trim()
+        merged.brokenPlayerStorePath.trim()
         ? merged.brokenPlayerStorePath
         : path.join(process.cwd(), `AquaBrokenPlayers.${process.pid}.jsonl`)
     this.send = merged.send || this._createDefaultSend()
@@ -850,6 +880,36 @@ class Aqua extends EventEmitter {
     return base
   }
 
+  _normalizeLavaSearchQuery(query) {
+    const fallbackSource = this.defaultSearchPlatform || 'spsearch'
+    if (typeof query === 'string') {
+      return {
+        query: query.trim(),
+        source: fallbackSource,
+        types: [...LAVASEARCH_DEFAULT_TYPES],
+        nodes: null
+      }
+    }
+
+    const queryText = String(query?.query || '').trim()
+    const source = String(query?.source || fallbackSource || '').trim()
+    const rawTypes = Array.isArray(query?.types) ? query.types : null
+    const mappedTypes = rawTypes?.length
+      ? rawTypes
+        .map((v) => String(v || '').toLowerCase().trim())
+        .filter((v) => LAVASEARCH_TYPES.includes(v))
+      : [...LAVASEARCH_DEFAULT_TYPES]
+
+    return {
+      query: queryText,
+      source,
+      types: mappedTypes.length
+        ? [...new Set(mappedTypes)]
+        : [...LAVASEARCH_DEFAULT_TYPES],
+      nodes: query?.nodes || null
+    }
+  }
+
   get(guildId) {
     const player = this.players.get(String(guildId))
     if (!player) throw new Error(`Player not found: ${guildId}`)
@@ -868,6 +928,154 @@ class Aqua extends EventEmitter {
     } catch {
       return null
     }
+  }
+
+  async lavaSearch(query, requester, throwOnEmpty = false) {
+    if (!query || !requester) return null
+    if (!this.initiated) throw new Error('Aqua not initialized')
+
+    const parsed = this._normalizeLavaSearchQuery(query)
+    if (!parsed.query) {
+      return {
+        tracks: [],
+        albums: [],
+        artists: [],
+        playlists: [],
+        texts: [],
+        pluginInfo: {}
+      }
+    }
+
+    const node = this._getRequestNode(parsed.nodes)
+    if (!node) throw new Error('No nodes available')
+
+    if (_functions.isUrl(parsed.query)) {
+      const fallback = await this.resolve({
+        query: parsed.query,
+        source: parsed.source,
+        requester,
+        nodes: node
+      })
+      return {
+        tracks: fallback?.tracks || [],
+        albums: [],
+        artists: [],
+        playlists: [],
+        texts: [],
+        pluginInfo: fallback?.pluginInfo || {}
+      }
+    }
+
+    const source = parsed.source || this.defaultSearchPlatform || 'spsearch'
+    const canUseLoadSearch =
+      !node?.isNodelink &&
+      !node?.info?.isNodelink &&
+      LAVASEARCH_SOURCES.has(source)
+
+    const mapCollection = (items) =>
+      Array.isArray(items)
+        ? items.map((v) => ({
+          info: v?.info || {},
+          pluginInfo: v?.pluginInfo || v?.plugin || {},
+          tracks: Array.isArray(v?.tracks)
+            ? v.tracks.map((t) => _functions.makeTrack(t, requester, node))
+            : []
+        }))
+        : []
+
+    if (!canUseLoadSearch) {
+      const fallback = await this.resolve({
+        query: parsed.query,
+        source,
+        requester,
+        nodes: node
+      })
+      const response = {
+        tracks: fallback?.tracks || [],
+        albums: [],
+        artists: [],
+        playlists: [],
+        texts: [],
+        pluginInfo: fallback?.pluginInfo || {}
+      }
+      if (
+        throwOnEmpty === true &&
+        !response.tracks.length &&
+        !response.albums.length &&
+        !response.artists.length &&
+        !response.playlists.length &&
+        !response.texts.length
+      ) {
+        throw new Error('Nothing found')
+      }
+      return response
+    }
+
+    const typeQuery = parsed.types?.length
+      ? `&types=${encodeURIComponent(parsed.types.join(','))}`
+      : ''
+    const endpoint = `/${this.restVersion}/loadsearch?query=${source ? `${source}:` : ''}${encodeURIComponent(parsed.query)}${typeQuery}`
+
+    let rawResponse
+    try {
+      rawResponse = await node.rest.makeRequest('GET', endpoint)
+    } catch (error) {
+      if (
+        error?.statusCode === 400 ||
+        error?.statusCode === 404 ||
+        error?.statusCode === 501
+      ) {
+        const fallback = await this.resolve({
+          query: parsed.query,
+          source,
+          requester,
+          nodes: node
+        })
+        return {
+          tracks: fallback?.tracks || [],
+          albums: [],
+          artists: [],
+          playlists: [],
+          texts: [],
+          pluginInfo: fallback?.pluginInfo || {}
+        }
+      }
+      throw new Error(
+        error?.name === 'AbortError'
+          ? 'Request timeout'
+          : `LavaSearch failed: ${error?.message || error}`
+      )
+    }
+
+    const response = rawResponse || {}
+    const result = {
+      tracks: Array.isArray(response.tracks)
+        ? response.tracks.map((t) => _functions.makeTrack(t, requester, node))
+        : [],
+      albums: mapCollection(response.albums),
+      artists: mapCollection(response.artists),
+      playlists: mapCollection(response.playlists),
+      texts: Array.isArray(response.texts)
+        ? response.texts.map((v) => ({
+          text: v?.text || '',
+          pluginInfo: v?.pluginInfo || v?.plugin || {}
+        }))
+        : [],
+      pluginInfo: response.pluginInfo || response.plugin || {}
+    }
+
+    if (
+      throwOnEmpty === true &&
+      !result.tracks.length &&
+      !result.albums.length &&
+      !result.artists.length &&
+      !result.playlists.length &&
+      !result.texts.length
+    ) {
+      throw new Error('Nothing found')
+    }
+
+    return result
   }
 
   async savePlayer(filePath = './AquaPlayers.jsonl') {

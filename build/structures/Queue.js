@@ -17,7 +17,18 @@ class Queue {
   }
 
   add(...tracks) {
-    this._items.push(...tracks)
+    if (!tracks?.length) return this
+    if (tracks.length === 1 && Array.isArray(tracks[0])) {
+      this._items.push(...tracks[0].filter(Boolean))
+      return this
+    }
+    for (const track of tracks) {
+      if (Array.isArray(track)) {
+        this._items.push(...track.filter(Boolean))
+      } else if (track) {
+        this._items.push(track)
+      }
+    }
     return this
   }
 
