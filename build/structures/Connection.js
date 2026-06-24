@@ -76,6 +76,7 @@ const _functions = {
     v.endpoint = conn.endpoint
     v.sessionId = conn.sessionId
     v.channelId = player.voiceChannel
+    v.resuming = player?._resuming ?? false
     payload.data.volume = player?.volume ?? 100
     return payload
   }
@@ -168,7 +169,8 @@ class Connection {
       STATE,
       RECONNECT_DELAY,
       MAX_RECONNECT_ATTEMPTS,
-      RESUME_BACKOFF_MAX
+      RESUME_BACKOFF_MAX,
+      sharedPool
     })
   }
 
@@ -240,6 +242,17 @@ class Connection {
         })
       }
       this.isWaitingForDisconnect = true
+      if (this.voiceChannel !== null) {
+        const oldChannel = this.voiceChannel
+        this.voiceChannel = null
+        if (p) p.voiceChannel = null
+        this._aqua.emit(
+          AqualinkEvents.PlayerMove,
+          p,
+          oldChannel,
+          null
+        )
+      }
       if (!this._nullChannelTimer) {
         this._nullChannelTimer = setTimeout(() => {
           this._nullChannelTimer = null
@@ -321,7 +334,9 @@ class Connection {
     } catch (e) {
       this._aqua?.emit?.(
         AqualinkEvents.Debug,
-        new Error(`Player destroy failed: ${e?.message || e}`)
+        new Error(
+          `Player destroy failed (guild=${this._guildId}, sessionId=${this.sessionId || 'none'}): ${e?.message || e}`
+        )
       )
     } finally {
       this._stateFlags &= ~STATE.DISCONNECTING
@@ -452,6 +467,15 @@ class Connection {
 
   _executeVoiceUpdate() {
     if (this._destroyed) return
+    if (this._stateFlags & STATE.DISCONNECTING) {
+      this._stateFlags &= ~STATE.UPDATE_SCHEDULED
+      this._voiceFlushTimer = null
+      if (this._pendingUpdate) {
+        sharedPool.release(this._pendingUpdate.payload)
+        this._pendingUpdate = null
+      }
+      return
+    }
     this._stateFlags &= ~STATE.UPDATE_SCHEDULED
     this._voiceFlushTimer = null
 

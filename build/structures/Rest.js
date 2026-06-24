@@ -134,6 +134,7 @@ class Rest {
     this.aqua = aqua
     this.node = node
     this.sessionId = node.sessionId
+    this._sessionGeneration = 0
     this.timeout = node.timeout || 30000
 
     const protocol = node.ssl ? 'https:' : 'http:'
@@ -236,10 +237,18 @@ class Rest {
 
   setSessionId(sessionId) {
     this.sessionId = sessionId
+    this._sessionGeneration++
   }
 
-  _getSessionPath() {
+  _getSessionPath(generation) {
     if (!this.sessionId) throw ERRORS.NO_SESSION
+    if (generation != null && generation !== this._sessionGeneration) {
+      const staleErr = new Error(
+        `Stale session: sessionId was updated (expected gen ${generation}, current ${this._sessionGeneration}) for session ${this.sessionId}`
+      )
+      staleErr.statusCode = 404
+      throw staleErr
+    }
     return `${this._apiBase}/sessions/${this.sessionId}`
   }
 
@@ -482,6 +491,15 @@ class Rest {
       )
 
       req.once('error', (e) => finish(false, e))
+      req.on('socket', (socket) => {
+        if (socket.errored) return
+        const onTimeout = () => {
+          req.destroy()
+          finish(false, new Error(`Socket timeout: ${this.timeout}ms`))
+        }
+        if (socket.connecting) socket.once('connect', () => socket.setTimeout(this.timeout, onTimeout))
+        else socket.setTimeout(this.timeout, onTimeout)
+      })
       timer = setTimeout(
         () => finish(false, new Error(`Request timeout: ${this.timeout}ms`)),
         this.timeout
@@ -639,28 +657,33 @@ class Rest {
   }
 
   async updatePlayer({ guildId, data, noReplace = false }) {
+    const gen = this._sessionGeneration
     return this.makeRequest(
       'PATCH',
-      `${this._getSessionPath()}/players/${guildId}?noReplace=${noReplace}`,
+      `${this._getSessionPath(gen)}/players/${guildId}?noReplace=${noReplace}`,
       data
     )
   }
 
   async getPlayer(guildId) {
+    const gen = this._sessionGeneration
     return this.makeRequest(
       'GET',
-      `${this._getSessionPath()}/players/${guildId}`
+      `${this._getSessionPath(gen)}/players/${guildId}`
     )
   }
 
   async getPlayers() {
-    return this.makeRequest('GET', `${this._getSessionPath()}/players`)
+    const gen = this._sessionGeneration
+    return this.makeRequest('GET', `${this._getSessionPath(gen)}/players`)
   }
 
-  async destroyPlayer(guildId) {
+  async destroyPlayer(guildId, abortSignal) {
+    const gen = this._sessionGeneration
+    if (abortSignal?.aborted) return null
     return this.makeRequest(
       'DELETE',
-      `${this._getSessionPath()}/players/${guildId}`
+      `${this._getSessionPath(gen)}/players/${guildId}`
     )
   }
 
@@ -733,9 +756,10 @@ class Rest {
 
     if (guildId) {
       try {
+        const gen = this._sessionGeneration
         const lyrics = await this.makeRequest(
           'GET',
-          `${this._getSessionPath()}/players/${guildId}/track/lyrics?skipTrackSource=${skip}`
+          `${this._getSessionPath(gen)}/players/${guildId}/track/lyrics?skipTrackSource=${skip}`
         )
         if (this._validLyrics(lyrics)) return lyrics
       } catch {}
@@ -776,10 +800,11 @@ class Rest {
 
   async subscribeLiveLyrics(guildId, skipTrackSource = false) {
     try {
+      const gen = this._sessionGeneration
       return (
         (await this.makeRequest(
           'POST',
-          `${this._getSessionPath()}/players/${guildId}/lyrics/subscribe?skipTrackSource=${skipTrackSource ? 'true' : 'false'}`
+          `${this._getSessionPath(gen)}/players/${guildId}/lyrics/subscribe?skipTrackSource=${skipTrackSource ? 'true' : 'false'}`
         )) === null
       )
     } catch {
@@ -789,10 +814,11 @@ class Rest {
 
   async unsubscribeLiveLyrics(guildId) {
     try {
+      const gen = this._sessionGeneration
       return (
         (await this.makeRequest(
           'DELETE',
-          `${this._getSessionPath()}/players/${guildId}/lyrics/subscribe`
+          `${this._getSessionPath(gen)}/players/${guildId}/lyrics/subscribe`
         )) === null
       )
     } catch {

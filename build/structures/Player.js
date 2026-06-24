@@ -35,6 +35,7 @@ const EVENT_HANDLERS = Object.freeze({
   PlayerDestroyedEvent: 'playerDestroyed',
   LyricsNotFoundEvent: 'lyricsNotFound',
   MixStartedEvent: 'mixStarted',
+  PlayerReconnectingEvent: 'PlayerReconnectingEvent',
   MixEndedEvent: 'mixEnded'
 })
 
@@ -122,7 +123,8 @@ class MicrotaskUpdateBatcher {
     const { player: p, updates: u } = this
     this.updates = null
     this.scheduled = false
-    if (!u || !p) return Promise.resolve()
+    if (!u || !p || p.destroyed || p.state === PLAYER_STATE.DISCONNECTING)
+      return Promise.resolve()
     return p.updatePlayer(u).catch((err) => {
       _functions.emitAquaError(
         p.aqua,
@@ -166,8 +168,12 @@ class CircularBuffer {
 
   push(item) {
     if (!item) return
+    const oldIndex = this.index
     this.buffer[this.index] = item
     this.index = (this.index + 1) % this.size
+    if (this.count === this.size) {
+      this.buffer[oldIndex] = null
+    }
     if (this.count < this.size) this.count++
   }
 
@@ -296,7 +302,9 @@ class Player extends EventEmitter {
   }
 
   _isVoiceRecoveryActive(token) {
-    return !!token && !this.destroyed && this._activeVoiceRecoveryToken === token
+    return (
+      !!token && !this.destroyed && this._activeVoiceRecoveryToken === token
+    )
   }
 
   _clearVoiceRecovery(token = this._activeVoiceRecoveryToken, reason = null) {
@@ -672,6 +680,11 @@ class Player extends EventEmitter {
 
   async play(track, options = {}) {
     if (this.destroyed || !this.queue) return this
+    if (options != null && typeof options !== 'object') {
+      throw new TypeError(
+        `Player.play(): options must be an object, got ${typeof options}`
+      )
+    }
 
     let item = track
     if (!item) {
@@ -804,7 +817,8 @@ class Player extends EventEmitter {
   }
 
   connect(options = {}) {
-    if (this.destroyed) throw new Error('Cannot connect destroyed player')
+    if (this.destroyed)
+      throw new Error(`Cannot connect destroyed player (guild=${this.guildId})`)
 
     const voiceChannel = _functions.toId(
       options.voiceChannel || this.voiceChannel
@@ -862,38 +876,29 @@ class Player extends EventEmitter {
   }
 
   destroy(options = {}) {
+    if (this.destroyed) return this
+
     const {
       preserveClient = true,
       skipRemote = false,
       preserveMessage = false,
       preserveReconnecting = false,
-      preserveTracks = false
+      preserveTracks = false,
+      abortSignal = null
     } = options
-    if (this.destroyed && !this.queue) {
-      this._reconnectNonce++
-      if (this._reconnectTimers) {
-        _functions.clearTimers(this._reconnectTimers)
-        this._reconnectTimers = null
-      }
-      this._reconnecting = false
-      this._isActivelyReconnecting = false
-      return this
-    }
 
-    if (!this.destroyed) {
-      this._reconnectNonce++
-      this.destroyed = true
-      this._clearVoiceRecovery(undefined, 'destroyed')
-      if (this.aqua?.debugTrace) {
-        this.aqua._trace('player.destroy', {
-          guildId: this.guildId,
-          skipRemote: !!skipRemote,
-          preserveTracks: !!preserveTracks,
-          preserveReconnecting: !!preserveReconnecting
-        })
-      }
-      this.emit('destroy')
+    this._reconnectNonce++
+    this.destroyed = true
+    this._clearVoiceRecovery(undefined, 'destroyed')
+    if (this.aqua?.debugTrace) {
+      this.aqua._trace('player.destroy', {
+        guildId: this.guildId,
+        skipRemote: !!skipRemote,
+        preserveTracks: !!preserveTracks,
+        preserveReconnecting: !!preserveReconnecting
+      })
     }
+    this.emit('destroy')
 
     if (this._voiceWatchdogTimer) {
       clearInterval(this._voiceWatchdogTimer)
@@ -903,7 +908,6 @@ class Player extends EventEmitter {
     _functions.clearTimers(this._pendingTimers)
     this._pendingTimers = null
 
-    // Clear reconnection timers to prevent memory leaks when destroyed externally
     if (this._reconnectTimers) {
       _functions.clearTimers(this._reconnectTimers)
       this._reconnectTimers = null
@@ -953,8 +957,23 @@ class Player extends EventEmitter {
     this.previousTracks = null
     this.previousIdentifiers?.clear()
     this.previousIdentifiers = null
-    this.queue?.clear()
+    if (this.queue) {
+      for (
+        let i = this.queue._head || 0;
+        i < (this.queue._items?.length || 0);
+        i++
+      ) {
+        const t = this.queue._items[i]
+        if (t && typeof t.dispose === 'function') {
+          try {
+            t.dispose()
+          } catch {}
+        }
+      }
+      this.queue.clear()
+    }
     this.queue = null
+    // ML-1: Clear _dataStore to prevent unbounded growth
     this._dataStore?.clear()
     this._dataStore = null
 
@@ -982,14 +1001,25 @@ class Player extends EventEmitter {
 
     if (!skipRemote) {
       try {
-        this.send({ guild_id: this.guildId, channel_id: null })
-        this.aqua?.destroyPlayer?.(this.guildId)
-        if (this.nodes?.connected)
-          this.nodes.rest?.destroyPlayer(this.guildId).catch((error) =>
-            reportSuppressedError(this, 'player.destroy.remote', error, {
-              guildId: this.guildId
+        if (abortSignal?.aborted) {
+          if (this.aqua?.debugTrace) {
+            this.aqua._trace('player.destroy.aborted', {
+              guildId: this.guildId,
+              reason: 'abort_signal_already_set'
             })
-          )
+          }
+        } else {
+          this.send({ guild_id: this.guildId, channel_id: null })
+          this.aqua?.destroyPlayer?.(this.guildId)
+          if (this.nodes?.connected)
+            this.nodes.rest
+              ?.destroyPlayer(this.guildId, abortSignal)
+              .catch((error) => {
+                reportSuppressedError(this, 'player.destroy.remote', error, {
+                  guildId: this.guildId
+                })
+              })
+        }
       } catch (error) {
         reportSuppressedError(this, 'player.destroy.gateway', error, {
           guildId: this.guildId
@@ -997,12 +1027,23 @@ class Player extends EventEmitter {
       }
     }
 
-    if (!preserveClient) this.aqua = this.nodes = null
+    if (!preserveClient) {
+      try {
+        this.aqua?.removeListener?.('playerUpdate', this._boundPlayerUpdate)
+      } catch {}
+      this.aqua = this.nodes = null
+    }
     return this
   }
 
   pause(paused) {
-    if (this.destroyed || this.paused === !!paused) return this
+    if (this.destroyed) return this
+    if (paused != null && typeof paused !== 'boolean') {
+      throw new TypeError(
+        `Player.pause(): paused must be a boolean, got ${typeof paused}`
+      )
+    }
+    if (this.paused === !!paused) return this
     this.paused = !!paused
     this.batchUpdatePlayer({ paused: this.paused }, true).catch((error) =>
       reportSuppressedError(this, 'player.pause', error, {
@@ -1014,8 +1055,12 @@ class Player extends EventEmitter {
   }
 
   seek(position) {
-    if (this.destroyed || !this.playing || !_functions.isNum(position))
-      return this
+    if (position == null || !_functions.isNum(position)) {
+      throw new TypeError(
+        `Player.seek(): position must be a non-negative number, got ${typeof position}`
+      )
+    }
+    if (this.destroyed || !this.playing) return this
     const len = this.current?.info?.length || 0
     const clamped = len
       ? Math.min(Math.max(position, 0), len)
@@ -1089,6 +1134,14 @@ class Player extends EventEmitter {
   }
 
   setVolume(volume) {
+    if (
+      volume == null ||
+      (typeof volume !== 'number' && typeof volume !== 'string')
+    ) {
+      throw new TypeError(
+        `Player.setVolume(): volume must be a number, got ${typeof volume}`
+      )
+    }
     const vol = _functions.clamp(volume)
     if (this.destroyed || this.volume === vol) return this
     this.volume = vol
@@ -1229,21 +1282,23 @@ class Player extends EventEmitter {
     const prev = this.previous
     const info = prev?.info
     if (!info?.sourceName || !info.identifier) return this
-    const { sourceName, identifier, uri, author } = info
+    const { sourceName, identifier, uri, author, title } = info
     this.isAutoplay = true
 
-    if (sourceName === 'spotify' && info.identifier) {
-      this.previousIdentifiers.add(info.identifier)
-      if (this.previousIdentifiers.size > PREVIOUS_IDS_MAX) {
-        this.previousIdentifiers.delete(
-          this.previousIdentifiers.values().next().value
-        )
-      }
-      if (!this.autoplaySeed) {
-        this.autoplaySeed = {
-          trackId: identifier,
-          artistIds: Array.isArray(author) ? author.join(',') : author
+    if (sourceName === 'spotify') {
+      if (info.identifier && info.identifier !== 'local') {
+        this.previousIdentifiers.add(info.identifier)
+        if (this.previousIdentifiers.size > PREVIOUS_IDS_MAX) {
+          this.previousIdentifiers.delete(
+            this.previousIdentifiers.values().next().value
+          )
         }
+      }
+      this.autoplaySeed = {
+        trackId: identifier,
+        isrc: prev.isrc || null,
+        title: title || null,
+        author: author || null
       }
     }
 
@@ -1292,6 +1347,7 @@ class Player extends EventEmitter {
   }
 
   async _getAutoplayTrack(sourceName, identifier, uri, requester) {
+<<<<<<< HEAD
     const normalizedSource = String(sourceName || '').toLowerCase().trim()
 
     const currentInfo = this.current?.info || {}
@@ -1307,6 +1363,23 @@ class Player extends EventEmitter {
       if (typeof value === 'string' || typeof value === 'number')
         return String(value).trim()
       return ''
+=======
+    const seen = new Set(this.previousIdentifiers)
+    const prevId = this.current?.identifier
+    if (prevId) seen.add(prevId)
+
+    if (sourceName === 'youtube' || sourceName === 'ytmusic') {
+      const res = await this.aqua.resolve({
+        query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`,
+        source: 'ytmsearch',
+        requester
+      })
+      if (_functions.isInvalidLoad(res) || !res.tracks?.length) return null
+      const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
+      return candidates.length
+        ? candidates[_functions.randIdx(candidates.length)]
+        : res.tracks[_functions.randIdx(res.tracks.length)]
+>>>>>>> upstream/main
     }
     const firstValue = (...values) => {
       for (const value of values) {
@@ -1406,14 +1479,32 @@ class Player extends EventEmitter {
     if (normalizedSource === 'soundcloud') {
       const scRes = await scAutoPlay(uri)
       if (!scRes?.length) return null
-      const res = await this.aqua.resolve({
-        query: scRes[0],
-        source: 'scsearch',
-        requester
-      })
-      return _functions.isInvalidLoad(res)
-        ? null
-        : res.tracks[_functions.randIdx(res.tracks.length)]
+      
+      for (const link of scRes) {
+        const res = await this.aqua.resolve({
+          query: link,
+          source: 'scsearch',
+          requester
+        })
+        if (!_functions.isInvalidLoad(res) && res.tracks?.length) {
+          const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
+          if (candidates.length) {
+            return candidates[_functions.randIdx(candidates.length)]
+          }
+        }
+      }
+      
+      for (const link of scRes) {
+        const res = await this.aqua.resolve({
+          query: link,
+          source: 'scsearch',
+          requester
+        })
+        if (!_functions.isInvalidLoad(res) && res.tracks?.length) {
+          return res.tracks[_functions.randIdx(res.tracks.length)]
+        }
+      }
+      return null
     }
     if (normalizedSource === 'spotify') {
       const isNodelink = !!this.nodes?.isNodelink || !!this.nodes?.info?.isNodelink
@@ -1555,6 +1646,7 @@ class Player extends EventEmitter {
     const isReplaced = reason === 'replaced'
 
     if (track) this.previousTracks.push(track)
+    if (isReplaced) return
     if (this.shouldDeleteMessage && !this._reconnecting && !this._resuming)
       _functions.safeDel(this.nowPlayingMessage)
     if (!isReplaced) this.current = null
@@ -1648,9 +1740,15 @@ class Player extends EventEmitter {
   mixEnded(_p, t, payload) {
     _functions.emitIfActive(this, AqualinkEvents.MixEnded, t, payload)
   }
+  PlayerReconnectingEvent(_p, _t, payload) {
+    this._resuming = true
+    _functions.emitIfActive(this, AqualinkEvents.PlayerReconnectingEvent, payload)
+    this.connection?.resendVoiceUpdate?.(true)
+    this.aqua.emit(AqualinkEvents.PlayerReconnect, this, { resuming: true })
+  }
 
-  async _attemptVoiceResume() {
-    return this._lifecycleController.attemptVoiceResume()
+  async _attemptVoiceResume(abortSignal) {
+    return this._lifecycleController.attemptVoiceResume(abortSignal)
   }
 
   async socketClosed(_player, _track, payload) {
@@ -1668,7 +1766,7 @@ class Player extends EventEmitter {
     } catch (err) {
       _functions.emitAquaError(
         this.aqua,
-        new Error(`Send fail: ${err.message}`)
+        new Error(`Send fail (guild=${this.guildId}): ${err.message}`)
       )
       return false
     }

@@ -9,6 +9,7 @@ class ConnectionRecovery {
     this.RECONNECT_DELAY = deps.RECONNECT_DELAY
     this.MAX_RECONNECT_ATTEMPTS = deps.MAX_RECONNECT_ATTEMPTS
     this.RESUME_BACKOFF_MAX = deps.RESUME_BACKOFF_MAX
+    this.sharedPool = deps.sharedPool
   }
 
   setServerUpdate(data) {
@@ -153,7 +154,7 @@ class ConnectionRecovery {
       `Attempt resume: guild=${conn._guildId} endpoint=${conn.endpoint} session=${conn.sessionId}`
     )
 
-    const payload = sharedPool.acquire()
+    const payload = this.sharedPool.acquire()
     try {
       this._functions.fillVoicePayload(
         payload,
@@ -162,6 +163,14 @@ class ConnectionRecovery {
         conn._player,
         true
       )
+
+      if (conn._destroyed || !conn._player || conn._player.destroyed) {
+        conn._aqua.emit(
+          AqualinkEvents.Debug,
+          `Resume aborted: player destroyed during attempt for guild ${conn._guildId}`
+        )
+        return false
+      }
 
       if (conn._stateGeneration !== currentGen) {
         conn._aqua.emit(
@@ -178,6 +187,10 @@ class ConnectionRecovery {
         })
       }
 
+      if (conn._destroyed || conn._player?.destroyed) {
+        return false
+      }
+
       conn._reconnectAttempts = 0
       conn._consecutiveFailures = 0
       if (conn._player) conn._player._resuming = false
@@ -189,10 +202,17 @@ class ConnectionRecovery {
       return true
     } catch (error) {
       if (conn._destroyed || !conn._aqua) throw error
+      if (conn._player?.destroyed) {
+        conn._aqua.emit(
+          AqualinkEvents.Debug,
+          `Resume aborted: player destroyed during retry for guild ${conn._guildId}`
+        )
+        return false
+      }
       conn._consecutiveFailures++
       conn._aqua.emit(
         AqualinkEvents.Debug,
-        `Resume failed for guild ${conn._guildId}: ${error?.message || error}`
+        `Resume failed for guild ${conn._guildId} (sessionId=${conn.sessionId || 'none'}, endpoint=${conn.endpoint || 'none'}): ${error?.message || error}`
       )
       if (conn._aqua?.debugTrace) {
         conn._aqua._trace('connection.resume.error', {
@@ -204,7 +224,8 @@ class ConnectionRecovery {
       if (
         conn._reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS &&
         !conn._destroyed &&
-        conn._consecutiveFailures < 5
+        conn._consecutiveFailures < 5 &&
+        !conn._player?.destroyed
       ) {
         const delay = Math.min(
           this.RECONNECT_DELAY * (1 << (conn._reconnectAttempts - 1)),
@@ -222,7 +243,7 @@ class ConnectionRecovery {
       return false
     } finally {
       conn._stateFlags &= ~this.STATE.ATTEMPTING_RESUME
-      sharedPool.release(payload)
+      this.sharedPool.release(payload)
     }
   }
 
@@ -265,7 +286,10 @@ class ConnectionRecovery {
         return false
       })
       if (resumed) {
-        conn._player?._clearVoiceRecovery?.(recoveryToken, 'missing_player_resumed')
+        conn._player?._clearVoiceRecovery?.(
+          recoveryToken,
+          'missing_player_resumed'
+        )
       } else if (conn._player?._isVoiceRecoveryActive?.(recoveryToken)) {
         conn.resendVoiceUpdate(true)
       }
@@ -306,8 +330,12 @@ class ConnectionRecovery {
 
   async sendUpdate(payload) {
     const conn = this.connection
-    if (conn._destroyed) throw new Error('Connection destroyed')
-    if (!conn._rest) throw new Error('REST interface unavailable')
+    if (conn._destroyed)
+      throw new Error(`Connection destroyed (guild=${conn._guildId})`)
+    if (!conn._rest)
+      throw new Error(
+        `REST interface unavailable (guild=${conn._guildId}, sessionId=${conn.sessionId || 'none'})`
+      )
 
     try {
       if (conn._aqua?.debugTrace) {
@@ -342,7 +370,7 @@ class ConnectionRecovery {
         if (conn._aqua) {
           conn._aqua.emit(
             AqualinkEvents.Debug,
-            `[Aqua/Connection] Player ${conn._guildId} not found (404)${isSessionError ? ' - Session invalid' : ''}. Recovery failed, destroying.`
+            `[Aqua/Connection] Player ${conn._guildId} not found (404, sessionId=${conn.sessionId || 'none'}, endpoint=${conn.endpoint || 'none'})${isSessionError ? ' - Session invalid' : ''}. Recovery failed, destroying.`
           )
           await conn._aqua.destroyPlayer(conn._guildId)
         }
@@ -358,41 +386,5 @@ class ConnectionRecovery {
     }
   }
 }
-
-class PayloadPool {
-  constructor() {
-    this._pool = []
-    this._size = 0
-  }
-
-  _create() {
-    return {
-      guildId: null,
-      data: {
-        voice: {
-          token: null,
-          endpoint: null,
-          sessionId: null
-        },
-        volume: null
-      }
-    }
-  }
-
-  acquire() {
-    return this._size > 0 ? this._pool[--this._size] : this._create()
-  }
-
-  release(payload) {
-    if (!payload || this._size >= 12) return
-    payload.guildId = null
-    const v = payload.data.voice
-    v.token = v.endpoint = v.sessionId = null
-    payload.data.volume = null
-    this._pool[this._size++] = payload
-  }
-}
-
-const sharedPool = new PayloadPool()
 
 module.exports = ConnectionRecovery

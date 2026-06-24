@@ -1,4 +1,4 @@
-const fs = require('node:fs')
+﻿const fs = require('node:fs')
 const path = require('node:path')
 const _readline = require('node:readline')
 const { EventEmitter } = require('node:events')
@@ -103,7 +103,11 @@ const _functions = {
   isUrl: (query) => {
     if (typeof query !== 'string' || query.length <= 8) return false
     const q = query.trimStart()
-    return q.startsWith('http://') || q.startsWith('https://')
+    return (
+      q.startsWith('http://') ||
+      q.startsWith('https://') ||
+      q.includes(':')
+    )
   },
   formatQuery(query, source) {
     return this.isUrl(query) ? query : `${source}${SEARCH_PREFIX}${query}`
@@ -221,7 +225,10 @@ class Aqua extends EventEmitter {
 
   _trace(event, data = null) {
     if (!this.debugTrace) return
-    if (!this._traceBuffer || this._traceBuffer.length !== this.traceMaxEntries) {
+    if (
+      !this._traceBuffer ||
+      this._traceBuffer.length !== this.traceMaxEntries
+    ) {
       this._traceBuffer = new Array(this.traceMaxEntries)
       this._traceBufferCount = 0
       this._traceBufferIndex = 0
@@ -376,9 +383,14 @@ class Aqua extends EventEmitter {
         this._invalidateCache()
         queueMicrotask(() => {
           this._storeBrokenPlayers(node).catch((error) =>
-            reportSuppressedError(this, 'aqua.nodeDisconnect.storeBrokenPlayers', error, {
-              node: node?.name || node?.host
-            })
+            reportSuppressedError(
+              this,
+              'aqua.nodeDisconnect.storeBrokenPlayers',
+              error,
+              {
+                node: node?.name || node?.host
+              }
+            )
           )
           this._performCleanup()
         })
@@ -784,9 +796,8 @@ class Aqua extends EventEmitter {
       query,
       source || this.defaultSearchPlatform
     )
-    const endpoint = `/${this.restVersion}/loadtracks?identifier=${encodeURIComponent(formatted)}`
     try {
-      const response = await node.rest.makeRequest('GET', endpoint)
+      const response = await node.rest.loadTracks(formatted)
       if (
         !response ||
         response.loadType === 'empty' ||
@@ -795,11 +806,13 @@ class Aqua extends EventEmitter {
         return EMPTY_TRACKS_RESPONSE
       return this._constructResponse(response, requester, node)
     } catch (error) {
-      throw new Error(
-        error?.name === 'AbortError'
-          ? 'Request timeout'
-          : `Resolve failed: ${error?.message || error}`
-      )
+      if (error?.name === 'AbortError') throw new Error('Request timeout')
+      const err = new Error(`Resolve failed: ${error?.message || error}`)
+      if (error?.statusCode != null) err.statusCode = error.statusCode
+      if (error?.body) err.body = error.body
+      if (error?.url) err.url = error.url
+      err.cause = error
+      throw err
     }
   }
 
