@@ -1347,8 +1347,24 @@ class Player extends EventEmitter {
   }
 
   async _getAutoplayTrack(sourceName, identifier, uri, requester) {
-<<<<<<< HEAD
+    const seen = new Set(Array.from(this.previousIdentifiers || []))
+    const currentId = this.current?.info?.identifier || this.current?.identifier
+    if (currentId) seen.add(currentId)
+
     const normalizedSource = String(sourceName || '').toLowerCase().trim()
+
+    if (normalizedSource === 'youtube' || normalizedSource === 'ytmusic') {
+      const res = await this.aqua.resolve({
+        query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`,
+        source: 'ytmsearch',
+        requester
+      })
+      if (_functions.isInvalidLoad(res) || !res.tracks?.length) return null
+      const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
+      return candidates.length
+        ? candidates[_functions.randIdx(candidates.length)]
+        : res.tracks[_functions.randIdx(res.tracks.length)]
+    }
 
     const currentInfo = this.current?.info || {}
     const pluginInfo =
@@ -1363,23 +1379,6 @@ class Player extends EventEmitter {
       if (typeof value === 'string' || typeof value === 'number')
         return String(value).trim()
       return ''
-=======
-    const seen = new Set(this.previousIdentifiers)
-    const prevId = this.current?.identifier
-    if (prevId) seen.add(prevId)
-
-    if (sourceName === 'youtube' || sourceName === 'ytmusic') {
-      const res = await this.aqua.resolve({
-        query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`,
-        source: 'ytmsearch',
-        requester
-      })
-      if (_functions.isInvalidLoad(res) || !res.tracks?.length) return null
-      const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
-      return candidates.length
-        ? candidates[_functions.randIdx(candidates.length)]
-        : res.tracks[_functions.randIdx(res.tracks.length)]
->>>>>>> upstream/main
     }
     const firstValue = (...values) => {
       for (const value of values) {
@@ -1449,10 +1448,6 @@ class Player extends EventEmitter {
     const seedAlbumId = toNumericId(
       firstValue(firstPluginValue(['albumId', 'album_id']))
     )
-
-    const seen = new Set(Array.from(this.previousIdentifiers || []))
-    const currentId = this.current?.info?.identifier || this.current?.identifier
-    if (currentId) seen.add(currentId)
 
     const pickCandidate = (tracks = []) => {
       const candidates = tracks.filter((track) => {
