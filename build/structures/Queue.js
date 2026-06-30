@@ -54,6 +54,11 @@ class Queue {
     if (this._head <= 0) return
     if (!force && this._head < this._compactThreshold) return
     const len = this._items.length - this._head
+    if (len <= 0) {
+      this._items.length = 0
+      this._head = 0
+      return
+    }
     for (let i = 0; i < len; i++) {
       this._items[i] = this._items[this._head + i]
     }
