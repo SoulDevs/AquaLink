@@ -39,7 +39,11 @@ const AqualinkEvents = {
   PlayerReconnectingEvent: 'PlayerReconnectingEvent',
   PlayerReconnect: 'playerReconnect',
   MixStarted: 'mixStarted',
-  MixEnded: 'mixEnded'
+  MixEnded: 'mixEnded',
+  ConnectionStatus: 'connectionStatus',
+  SegmentSkipped: 'segmentSkipped',
+  ChaptersLoaded: 'chaptersLoaded',
+  RecordTrack: 'recordTrack'
 }
 
 module.exports = { AqualinkEvents }

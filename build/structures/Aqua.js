@@ -1,4 +1,4 @@
-﻿const fs = require('node:fs')
+const fs = require('node:fs')
 const path = require('node:path')
 const _readline = require('node:readline')
 const { EventEmitter } = require('node:events')
@@ -7,7 +7,7 @@ const AquaRecovery = require('./AquaRecovery')
 const Node = require('./Node')
 const Player = require('./Player')
 const Track = require('./Track')
-const { reportSuppressedError } = require('./Reporting')
+const { emitOperationalError, reportSuppressedError } = require('./Reporting')
 const { version: pkgVersion } = require('../../package.json')
 
 const SEARCH_PREFIX = ':'
@@ -104,13 +104,11 @@ const _functions = {
     if (typeof query !== 'string' || query.length <= 8) return false
     const q = query.trimStart()
     return (
-      q.startsWith('http://') ||
-      q.startsWith('https://') ||
-      q.includes(':')
+      q.startsWith('http://') || q.startsWith('https://') || q.includes(':')
     )
   },
   formatQuery(query, source) {
-    return this.isUrl(query) ? query : `${source}${SEARCH_PREFIX}${query}`
+    return _functions.isUrl(query) ? query : `${source}${SEARCH_PREFIX}${query}`
   },
   makeTrack: (t, requester, node) => new Track(t, requester, node),
   safeCall(fn) {
@@ -303,6 +301,35 @@ class Aqua extends EventEmitter {
     }
     this._scheduleVoiceStateFlush()
     return true
+  }
+
+  getVoiceStateQueueDelay(guildId) {
+    const target = guildId ? String(guildId) : ''
+    if (!target || !this._voiceStateQueued.has(target)) return 0
+
+    let position = 0
+    const seen = new Set()
+    for (
+      let index = this._voiceStateQueueHead;
+      index < this._voiceStateQueue.length;
+      index++
+    ) {
+      const queuedGuildId = this._voiceStateQueue[index]
+      if (
+        !queuedGuildId ||
+        seen.has(queuedGuildId) ||
+        !this._voiceStateQueued.has(queuedGuildId)
+      ) {
+        continue
+      }
+      seen.add(queuedGuildId)
+      position++
+      if (queuedGuildId === target) {
+        return position * VOICE_STATE_QUEUE_INTERVAL
+      }
+    }
+
+    return this._voiceStateQueued.size * VOICE_STATE_QUEUE_INTERVAL
   }
 
   _scheduleVoiceStateFlush(delay = 0) {
@@ -526,12 +553,7 @@ class Aqua extends EventEmitter {
       (stats.memory ? stats.memory.used / reservable : 0) * 40 +
       (node.rest?.calls || 0) * 0.001
     if (this._nodeLoadCache.size >= MAX_CACHE_SIZE) {
-      const iterator = this._nodeLoadCache.keys()
-      while (this._nodeLoadCache.size >= MAX_CACHE_SIZE) {
-        const oldest = iterator.next().value
-        if (!oldest) break
-        this._nodeLoadCache.delete(oldest)
-      }
+      this._nodeLoadCache.delete(this._nodeLoadCache.keys().next().value)
     }
     this._nodeLoadCache.set(id, { load, time: now })
     return load
@@ -583,17 +605,12 @@ class Aqua extends EventEmitter {
       attempts: 0,
       lastAttempt: 0
     }
-    try {
-      await node.connect()
-      this._failoverState[id].connected = true
-      this._failoverState[id].failoverInProgress = false
-      this._invalidateCache()
-      this.emit(AqualinkEvents.NodeCreate, node)
-      return node
-    } catch (error) {
-      this._cleanupNode(id)
-      throw error
-    }
+    await node.connect()
+    this._failoverState[id].connected = true
+    this._failoverState[id].failoverInProgress = false
+    this._invalidateCache()
+    this.emit(AqualinkEvents.NodeCreate, node)
+    return node
   }
 
   _destroyNode(id) {
@@ -1095,11 +1112,35 @@ class Aqua extends EventEmitter {
     const lockFile = `${filePath}.lock`
     const tempFile = `${filePath}.tmp`
     let ws = null
+    let lockAcquired = false
     try {
       await fs.promises.writeFile(lockFile, String(process.pid), { flag: 'wx' })
+      lockAcquired = true
       ws = fs.createWriteStream(tempFile, { encoding: 'utf8', flags: 'w' })
+      let streamError = null
+      ws.on('error', (error) => {
+        streamError = error
+      })
       const buffer = []
-      let drainPromise = Promise.resolve()
+      const write = (chunk) => {
+        if (ws.write(chunk)) return Promise.resolve()
+        return new Promise((resolve, reject) => {
+          const onDrain = () => {
+            cleanup()
+            resolve()
+          }
+          const onError = (error) => {
+            cleanup()
+            reject(error)
+          }
+          const cleanup = () => {
+            ws.off('drain', onDrain)
+            ws.off('error', onError)
+          }
+          ws.once('drain', onDrain)
+          ws.once('error', onError)
+        })
+      }
 
       const nodeSessions = {}
       for (const node of this.nodeMap.values()) {
@@ -1113,6 +1154,7 @@ class Aqua extends EventEmitter {
           t: player.textChannel,
           v: player.voiceChannel,
           u: player.current?.uri || null,
+          ud: player.current?.userData || null,
           p: player.position || 0,
           ts: player.timestamp || 0,
           q: player.queue
@@ -1131,29 +1173,36 @@ class Aqua extends EventEmitter {
         if (buffer.length >= WRITE_BUFFER_SIZE) {
           const chunk = `${buffer.join('\n')}\n`
           buffer.length = 0
-          if (!ws.write(chunk)) {
-            drainPromise = drainPromise.then(
-              () => new Promise((r) => ws.once('drain', r))
-            )
-          }
+          await write(chunk)
         }
       }
 
-      if (buffer.length) ws.write(`${buffer.join('\n')}\n`)
-      await drainPromise
-      await new Promise((resolve, reject) =>
-        ws.end((err) => (err ? reject(err) : resolve()))
-      )
+      if (buffer.length) await write(`${buffer.join('\n')}\n`)
+      if (streamError) throw streamError
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          ws.off('finish', onFinish)
+          reject(error)
+        }
+        const onFinish = () => {
+          ws.off('error', onError)
+          resolve()
+        }
+        ws.once('error', onError)
+        ws.once('finish', onFinish)
+        ws.end()
+      })
       ws = null
       await fs.promises.rename(tempFile, filePath)
     } catch (error) {
       console.error(`[Aqua/Autoresume]Error saving players:`, error)
-      this.emit(AqualinkEvents.Error, null, error)
+      emitOperationalError(this, null, error)
       if (ws) _functions.safeCall(() => ws.destroy())
       await fs.promises.unlink(tempFile).catch(_functions.noop)
     } finally {
       if (ws) _functions.safeCall(() => ws.destroy())
-      await fs.promises.unlink(lockFile).catch(_functions.noop)
+      if (lockAcquired)
+        await fs.promises.unlink(lockFile).catch(_functions.noop)
     }
   }
 

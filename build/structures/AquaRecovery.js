@@ -2,7 +2,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const readline = require('node:readline')
 const { AqualinkEvents } = require('./AqualinkEvents')
-const { reportSuppressedError } = require('./Reporting')
+const { emitOperationalError, reportSuppressedError } = require('./Reporting')
 
 class AquaRecovery {
   constructor(aqua, deps) {
@@ -221,7 +221,7 @@ class AquaRecovery {
         this.performCleanup()
       }
     } catch (error) {
-      this.aqua.emit(AqualinkEvents.Error, null, error)
+      emitOperationalError(this.aqua, null, error)
     } finally {
       state.failoverInProgress = false
     }
@@ -267,12 +267,32 @@ class AquaRecovery {
       async () => {
         const state = this.capturePlayerState(player)
         if (!state) throw new Error('Failed to capture state')
+        const oldMessage = player.nowPlayingMessage || null
+        const oldVoice = player.connection
+          ? {
+              sid: player.connection.sessionId,
+              ep: player.connection.endpoint,
+              tok: player.connection.token,
+              reg: player.connection.region,
+              cid: player.connection.channelId
+            }
+          : null
+        player.destroy({
+          preserveClient: true,
+          skipRemote: true,
+          preserveMessage: true,
+          preserveTracks: true,
+          preserveReconnecting: true
+        })
         const { maxRetries, retryDelay } = this.aqua.failoverOptions
         for (let retry = 0; retry < maxRetries; retry++) {
+          let newPlayer = null
           try {
             const targetNode = pickNode()
-            const newPlayer = this.createPlayerOnNode(targetNode, state)
+            newPlayer = this.createPlayerOnNode(targetNode, state)
+            this._applyVoiceBootstrap(newPlayer, oldVoice)
             await this.restorePlayerState(newPlayer, state)
+            if (oldMessage) newPlayer.nowPlayingMessage = oldMessage
             this.aqua.emit(
               AqualinkEvents.PlayerMigrated,
               player,
@@ -281,6 +301,13 @@ class AquaRecovery {
             )
             return newPlayer
           } catch (error) {
+            newPlayer?.destroy?.({
+              preserveClient: true,
+              skipRemote: true,
+              preserveMessage: true,
+              preserveTracks: true,
+              preserveReconnecting: true
+            })
             if (retry === maxRetries - 1) throw error
             await this._functions.delay(retryDelay * 1.5 ** retry)
           }
@@ -444,14 +471,25 @@ class AquaRecovery {
 
   seekAfterTrackStart(player, guildId, position, delay = 50) {
     if (!player || !guildId || !(position > 0)) return
+
+    let timeoutId = null
+    const cleanup = () => {
+      if (timeoutId) clearTimeout(timeoutId)
+      this.aqua.off(AqualinkEvents.TrackStart, seekOnce)
+      player.removeListener('destroy', cleanup)
+    }
+
     const seekOnce = (startedPlayer) => {
       if (startedPlayer.guildId !== guildId) return
+      cleanup()
       this._functions.unrefTimeout(() => player.seek?.(position), delay)
     }
-    this.aqua.once(AqualinkEvents.TrackStart, seekOnce)
-    player.once('destroy', () =>
-      this.aqua.off(AqualinkEvents.TrackStart, seekOnce)
-    )
+
+    timeoutId = setTimeout(cleanup, 30000)
+    if (timeoutId.unref) timeoutId.unref()
+
+    this.aqua.on(AqualinkEvents.TrackStart, seekOnce)
+    player.once('destroy', cleanup)
   }
 
   async restorePlayerState(newPlayer, state) {
@@ -487,10 +525,12 @@ class AquaRecovery {
     this.aqua._loading = true
     const lockFile = `${filePath}.lock`
     let stream = null,
-      rl = null
+      rl = null,
+      lockAcquired = false
     try {
       await fs.promises.access(filePath)
       await fs.promises.writeFile(lockFile, String(process.pid), { flag: 'wx' })
+      lockAcquired = true
       await this.waitForFirstNode()
 
       stream = fs.createReadStream(filePath, { encoding: 'utf8' })
@@ -536,13 +576,14 @@ class AquaRecovery {
     } catch (error) {
       if (error.code !== 'ENOENT') {
         console.error(`[Aqua/Autoresume]Error loading players:`, error)
-        this.aqua.emit(AqualinkEvents.Error, null, error)
+        emitOperationalError(this.aqua, null, error)
       }
     } finally {
       this.aqua._loading = false
       if (rl) this._functions.safeCall(() => rl.close())
       if (stream) this._functions.safeCall(() => stream.destroy())
-      await fs.promises.unlink(lockFile).catch(this._functions.noop)
+      if (lockAcquired)
+        await fs.promises.unlink(lockFile).catch(this._functions.noop)
     }
   }
 
@@ -600,7 +641,11 @@ class AquaRecovery {
           }
 
           this.seekAfterTrackStart(player, gId, p.p, 100)
-          await player.play(undefined, { startTime: p.p, paused: p.pa })
+          await player.play(undefined, {
+            startTime: p.p,
+            paused: p.pa,
+            userData: p.ud
+          })
         }
         if (p.nw && p.t) {
           const channel = this.aqua.client.channels?.cache?.get?.(p.t)
@@ -797,6 +842,7 @@ class AquaRecovery {
       t: state.textChannel,
       v: state.voiceChannel,
       u: state.current?.uri || null,
+      ud: state.current?.userData || null,
       p: state.position || 0,
       q: (state.queue || [])
         .slice(0, this.aqua.maxQueueSave)

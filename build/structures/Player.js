@@ -36,7 +36,11 @@ const EVENT_HANDLERS = Object.freeze({
   LyricsNotFoundEvent: 'lyricsNotFound',
   MixStartedEvent: 'mixStarted',
   PlayerReconnectingEvent: 'PlayerReconnectingEvent',
-  MixEndedEvent: 'mixEnded'
+  MixEndedEvent: 'mixEnded',
+  ConnectionStatusEvent: 'connectionStatus',
+  SegmentSkippedEvent: 'segmentSkipped',
+  ChaptersLoadedEvent: 'chaptersLoaded',
+  RecordTrackEvent: 'recordTrack'
 })
 
 const WATCHDOG_INTERVAL = 15000
@@ -168,12 +172,8 @@ class CircularBuffer {
 
   push(item) {
     if (!item) return
-    const oldIndex = this.index
     this.buffer[this.index] = item
     this.index = (this.index + 1) % this.size
-    if (this.count === this.size) {
-      this.buffer[oldIndex] = null
-    }
     if (this.count < this.size) this.count++
   }
 
@@ -321,11 +321,10 @@ class Player extends EventEmitter {
   async _handleEvent(payload) {
     if (this.destroyed || !payload?.type) return
     const handler = EVENT_HANDLERS[payload.type]
-    if (typeof this[handler] !== 'function') {
-      this.aqua.emit(
-        AqualinkEvents.NodeError,
-        this,
-        new Error(`Unknown event: ${payload.type}`)
+    if (!handler || typeof this[handler] !== 'function') {
+      this.aqua?.emit?.(
+        AqualinkEvents.Debug,
+        `[Aqualink] Unhandled player event: ${payload.type}`
       )
       return
     }
@@ -722,6 +721,7 @@ class Player extends EventEmitter {
       this.playing = true
       this.paused = !!options.paused
       this.position = options.startTime || 0
+      if (options.userData) this.current.userData = options.userData
       if (this.aqua?.debugTrace) {
         this.aqua._trace('player.play', {
           guildId: this.guildId,
@@ -789,6 +789,8 @@ class Player extends EventEmitter {
         track: { encoded: this.current.track },
         paused: this.paused
       }
+      if (this.current.userData)
+        updateData.track.userData = this.current.userData
       if (this.position > 0) updateData.position = this.position
 
       this._deferredStart = false
@@ -1359,11 +1361,35 @@ class Player extends EventEmitter {
         source: 'ytmsearch',
         requester
       })
-      if (_functions.isInvalidLoad(res) || !res.tracks?.length) return null
-      const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
-      return candidates.length
-        ? candidates[_functions.randIdx(candidates.length)]
-        : res.tracks[_functions.randIdx(res.tracks.length)]
+      if (!_functions.isInvalidLoad(res) && res.tracks?.length) {
+        const candidates = res.tracks.filter(
+          (t) => t.identifier && !seen.has(t.identifier)
+        )
+        return candidates.length
+          ? candidates[_functions.randIdx(candidates.length)]
+          : res.tracks[_functions.randIdx(res.tracks.length)]
+      }
+    } else if (normalizedSource === 'soundcloud') {
+      const scRes = await scAutoPlay(uri, this.nodes?.rest?._autoplayAgent)
+      if (scRes?.length) {
+        let anyValid = null
+        for (const link of scRes) {
+          const res = await this.aqua.resolve({
+            query: link,
+            source: 'scsearch',
+            requester
+          })
+          if (_functions.isInvalidLoad(res) || !res.tracks?.length) continue
+          if (!anyValid)
+            anyValid = res.tracks[_functions.randIdx(res.tracks.length)]
+          const candidates = res.tracks.filter(
+            (t) => t.identifier && !seen.has(t.identifier)
+          )
+          if (candidates.length)
+            return candidates[_functions.randIdx(candidates.length)]
+        }
+        if (anyValid) return anyValid
+      }
     }
 
     const currentInfo = this.current?.info || {}
@@ -1471,36 +1497,35 @@ class Player extends EventEmitter {
       return pickCandidate(res.tracks || [])
     }
 
-    if (normalizedSource === 'soundcloud') {
-      const scRes = await scAutoPlay(uri)
-      if (!scRes?.length) return null
-      
-      for (const link of scRes) {
-        const res = await this.aqua.resolve({
-          query: link,
-          source: 'scsearch',
-          requester
-        })
-        if (!_functions.isInvalidLoad(res) && res.tracks?.length) {
-          const candidates = res.tracks.filter(t => t.identifier && !seen.has(t.identifier))
-          if (candidates.length) {
-            return candidates[_functions.randIdx(candidates.length)]
+    const fallbackTitle = this.previous?.info?.title || this.autoplaySeed?.title
+    const fallbackAuthor = this.previous?.info?.author || this.autoplaySeed?.author
+    if (fallbackTitle) {
+      const query = `${fallbackAuthor ? `${fallbackAuthor} - ` : ''}${fallbackTitle}`
+      const searchRes = await this.aqua.resolve({
+        query,
+        source: 'ytmsearch',
+        requester
+      })
+      if (!_functions.isInvalidLoad(searchRes) && searchRes.tracks?.length) {
+        const ytId = searchRes.tracks[0].identifier
+        if (ytId) {
+          const ytMixRes = await this.aqua.resolve({
+            query: `https://www.youtube.com/watch?v=${ytId}&list=RD${ytId}`,
+            source: 'ytmsearch',
+            requester
+          })
+          if (!_functions.isInvalidLoad(ytMixRes) && ytMixRes.tracks?.length) {
+            const candidates = ytMixRes.tracks.filter(
+              (t) => t.identifier && !seen.has(t.identifier)
+            )
+            return candidates.length
+              ? candidates[_functions.randIdx(candidates.length)]
+              : ytMixRes.tracks[_functions.randIdx(ytMixRes.tracks.length)]
           }
         }
       }
-      
-      for (const link of scRes) {
-        const res = await this.aqua.resolve({
-          query: link,
-          source: 'scsearch',
-          requester
-        })
-        if (!_functions.isInvalidLoad(res) && res.tracks?.length) {
-          return res.tracks[_functions.randIdx(res.tracks.length)]
-        }
-      }
-      return null
     }
+
     if (normalizedSource === 'spotify') {
       const isNodelink = !!this.nodes?.isNodelink || !!this.nodes?.info?.isNodelink
       if (!isNodelink && seedIdentifier) {
@@ -1538,7 +1563,11 @@ class Player extends EventEmitter {
         requester,
         Array.from(this.previousIdentifiers)
       )
-      return res?.length ? pickCandidate(res) : null
+      if (res?.length) {
+        const candidate = pickCandidate(res)
+        if (candidate) return candidate
+        return res[_functions.randIdx(res.length)]
+      }
     }
 
     const attempts = []
@@ -1735,9 +1764,25 @@ class Player extends EventEmitter {
   mixEnded(_p, t, payload) {
     _functions.emitIfActive(this, AqualinkEvents.MixEnded, t, payload)
   }
+  connectionStatus(_p, _t, payload) {
+    _functions.emitIfActive(this, AqualinkEvents.ConnectionStatus, payload)
+  }
+  segmentSkipped(_p, _t, payload) {
+    _functions.emitIfActive(this, AqualinkEvents.SegmentSkipped, payload)
+  }
+  chaptersLoaded(_p, _t, payload) {
+    _functions.emitIfActive(this, AqualinkEvents.ChaptersLoaded, payload)
+  }
+  recordTrack(_p, _t, payload) {
+    _functions.emitIfActive(this, AqualinkEvents.RecordTrack, payload)
+  }
   PlayerReconnectingEvent(_p, _t, payload) {
     this._resuming = true
-    _functions.emitIfActive(this, AqualinkEvents.PlayerReconnectingEvent, payload)
+    _functions.emitIfActive(
+      this,
+      AqualinkEvents.PlayerReconnectingEvent,
+      payload
+    )
     this.connection?.resendVoiceUpdate?.(true)
     this.aqua.emit(AqualinkEvents.PlayerReconnect, this, { resuming: true })
   }
