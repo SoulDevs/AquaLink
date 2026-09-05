@@ -574,7 +574,7 @@ declare module 'aqualink' {
       track: Track,
       payload: Record<string, unknown>
     ): Promise<void>
-    queueUpdate(player: Player, queue: Queue): Promise<void> (feat: add queueUpdate event to AqualinkEvents, Queue, and Player)
+    queueUpdate(player: Player, queue: Queue): Promise<void>
   }
 
   export class Track {
