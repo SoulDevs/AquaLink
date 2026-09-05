@@ -230,7 +230,7 @@ class Player extends EventEmitter {
 
     this.connection = new Connection(this)
     this.filters = new Filters(this)
-    this.queue = new Queue()
+    this.queue = new Queue(this)
     this.previousIdentifiers = new Set()
     this.previousTracks = new CircularBuffer(PREVIOUS_TRACKS_SIZE)
     this._updateBatcher = batcherPool.acquire(this)
@@ -1846,6 +1846,21 @@ class Player extends EventEmitter {
 
   cleanup() {
     if (!this.playing && !this.paused && !this.queue?.size) this.destroy()
+  }
+
+  set queue(newQueue) {
+    this._queue = newQueue
+    if (newQueue && typeof newQueue === 'object') {
+      newQueue.player = this
+    }
+  }
+
+  get queue() {
+    return this._queue
+  }
+
+  queueUpdate(_player, queue) {
+    _functions.emitIfActive(this, AqualinkEvents.QueueUpdate, queue)
   }
 }
 

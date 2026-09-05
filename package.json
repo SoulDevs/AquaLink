@@ -1,6 +1,6 @@
 {
   "name": "aqualink",
-  "version": "3.2.0",
+  "version": "3.2.1", (feat: add queueUpdate event to AqualinkEvents, Queue, and Player)
   "description": "An Lavalink/Nodelink client, focused in pure performance and features",
   "main": "./build/index.js",
   "types": "./build/index.d.ts",

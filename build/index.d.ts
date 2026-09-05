@@ -574,6 +574,7 @@ declare module 'aqualink' {
       track: Track,
       payload: Record<string, unknown>
     ): Promise<void>
+    queueUpdate(player: Player, queue: Queue): Promise<void> (feat: add queueUpdate event to AqualinkEvents, Queue, and Player)
   }
 
   export class Track {
@@ -724,7 +725,8 @@ declare module 'aqualink' {
   }
 
   export class Queue extends Array<Track> {
-    constructor(...elements: Track[])
+    constructor(player?: Player | null, ...elements: Track[])
+    player: Player | null
 
     // Properties
     readonly size: number
@@ -1670,6 +1672,7 @@ declare module 'aqualink' {
     readonly LyricsFound: 'lyricsFound'
     readonly LyricsNotFound: 'lyricsNotFound'
     readonly QueueEnd: 'queueEnd'
+    readonly QueueUpdate: 'queueUpdate'
     readonly PlayerUpdate: 'playerUpdate'
     readonly PlayerMove: 'playerMove'
     readonly PlayerReconnected: 'playerReconnected'
